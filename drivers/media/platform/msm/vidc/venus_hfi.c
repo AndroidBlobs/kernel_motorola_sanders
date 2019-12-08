@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -27,6 +27,7 @@
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <linux/vmalloc.h>
 #include <soc/qcom/scm.h>
 #include <soc/qcom/smem.h>
 #include <soc/qcom/subsystem_restart.h>
@@ -327,7 +328,7 @@ static int __write_queue(struct vidc_iface_q_info *qinfo, u8 *packet,
 {
 	struct hfi_queue_header *queue;
 	u32 packet_size_in_words, new_write_idx;
-	u32 empty_space, read_idx;
+	u32 empty_space, read_idx, write_idx;
 	u32 *write_ptr;
 
 	if (!qinfo || !packet) {
@@ -350,16 +351,18 @@ static int __write_queue(struct vidc_iface_q_info *qinfo, u8 *packet,
 	}
 
 	packet_size_in_words = (*(u32 *)packet) >> 2;
-	if (!packet_size_in_words) {
-		dprintk(VIDC_ERR, "Zero packet size\n");
+	if (!packet_size_in_words || packet_size_in_words >
+		qinfo->q_array.mem_size>>2) {
+		dprintk(VIDC_ERR, "Invalid packet size\n");
 		return -ENODATA;
 	}
 
 	read_idx = queue->qhdr_read_idx;
+	write_idx = queue->qhdr_write_idx;
 
-	empty_space = (queue->qhdr_write_idx >=  read_idx) ?
-		(queue->qhdr_q_size - (queue->qhdr_write_idx -  read_idx)) :
-		(read_idx - queue->qhdr_write_idx);
+	empty_space = (write_idx >=  read_idx) ?
+		((qinfo->q_array.mem_size>>2) - (write_idx -  read_idx)) :
+		(read_idx - write_idx);
 	if (empty_space <= packet_size_in_words) {
 		queue->qhdr_tx_req =  1;
 		dprintk(VIDC_ERR, "Insufficient size (%d) to write (%d)\n",
@@ -369,13 +372,20 @@ static int __write_queue(struct vidc_iface_q_info *qinfo, u8 *packet,
 
 	queue->qhdr_tx_req =  0;
 
-	new_write_idx = (queue->qhdr_write_idx + packet_size_in_words);
+	new_write_idx = write_idx + packet_size_in_words;
 	write_ptr = (u32 *)((qinfo->q_array.align_virtual_addr) +
-		(queue->qhdr_write_idx << 2));
-	if (new_write_idx < queue->qhdr_q_size) {
+			(write_idx << 2));
+	if (write_ptr < (u32 *)qinfo->q_array.align_virtual_addr ||
+	    write_ptr > (u32 *)(qinfo->q_array.align_virtual_addr +
+	    qinfo->q_array.mem_size)) {
+		dprintk(VIDC_ERR, "Invalid write index");
+		return -ENODATA;
+	}
+
+	if (new_write_idx < (qinfo->q_array.mem_size >> 2)) {
 		memcpy(write_ptr, packet, packet_size_in_words << 2);
 	} else {
-		new_write_idx -= queue->qhdr_q_size;
+		new_write_idx -= qinfo->q_array.mem_size >> 2;
 		memcpy(write_ptr, packet, (packet_size_in_words -
 			new_write_idx) << 2);
 		memcpy((void *)qinfo->q_array.align_virtual_addr,
@@ -467,7 +477,8 @@ static int __read_queue(struct vidc_iface_q_info *qinfo, u8 *packet,
 	u32 packet_size_in_words, new_read_idx;
 	u32 *read_ptr;
 	u32 receive_request = 0;
-		int rc = 0;
+	u32 read_idx, write_idx;
+	int rc = 0;
 
 	if (!qinfo || !packet || !pb_tx_req_is_set) {
 		dprintk(VIDC_ERR, "Invalid Params\n");
@@ -498,7 +509,10 @@ static int __read_queue(struct vidc_iface_q_info *qinfo, u8 *packet,
 	if (queue->qhdr_type & HFI_Q_ID_CTRL_TO_HOST_MSG_Q)
 		receive_request = 1;
 
-	if (queue->qhdr_read_idx == queue->qhdr_write_idx) {
+	read_idx = queue->qhdr_read_idx;
+	write_idx = queue->qhdr_write_idx;
+
+	if (read_idx == write_idx) {
 		queue->qhdr_rx_req = receive_request;
 		*pb_tx_req_is_set = 0;
 		dprintk(VIDC_DBG,
@@ -510,21 +524,28 @@ static int __read_queue(struct vidc_iface_q_info *qinfo, u8 *packet,
 	}
 
 	read_ptr = (u32 *)((qinfo->q_array.align_virtual_addr) +
-				(queue->qhdr_read_idx << 2));
+				(read_idx << 2));
+	if (read_ptr < (u32 *)qinfo->q_array.align_virtual_addr ||
+	    read_ptr > (u32 *)(qinfo->q_array.align_virtual_addr +
+	    qinfo->q_array.mem_size - sizeof(*read_ptr))) {
+		dprintk(VIDC_ERR, "Invalid read index\n");
+		return -ENODATA;
+	}
+
 	packet_size_in_words = (*read_ptr) >> 2;
 	if (!packet_size_in_words) {
 		dprintk(VIDC_ERR, "Zero packet size\n");
 		return -ENODATA;
 	}
 
-	new_read_idx = queue->qhdr_read_idx + packet_size_in_words;
-	if (((packet_size_in_words << 2) <= VIDC_IFACEQ_VAR_HUGE_PKT_SIZE)
-			&& queue->qhdr_read_idx <= queue->qhdr_q_size) {
-		if (new_read_idx < queue->qhdr_q_size) {
+	new_read_idx = read_idx + packet_size_in_words;
+	if (((packet_size_in_words << 2) <= VIDC_IFACEQ_VAR_HUGE_PKT_SIZE) &&
+		read_idx <= (qinfo->q_array.mem_size >> 2)) {
+		if (new_read_idx < (qinfo->q_array.mem_size >> 2)) {
 			memcpy(packet, read_ptr,
 					packet_size_in_words << 2);
 		} else {
-			new_read_idx -= queue->qhdr_q_size;
+			new_read_idx -= (qinfo->q_array.mem_size >> 2);
 			memcpy(packet, read_ptr,
 			(packet_size_in_words - new_read_idx) << 2);
 			memcpy(packet + ((packet_size_in_words -
@@ -535,18 +556,19 @@ static int __read_queue(struct vidc_iface_q_info *qinfo, u8 *packet,
 	} else {
 		dprintk(VIDC_WARN,
 			"BAD packet received, read_idx: %#x, pkt_size: %d\n",
-			queue->qhdr_read_idx, packet_size_in_words << 2);
+			read_idx, packet_size_in_words << 2);
 		dprintk(VIDC_WARN, "Dropping this packet\n");
-		new_read_idx = queue->qhdr_write_idx;
+		new_read_idx = write_idx;
 		rc = -ENODATA;
 	}
 
-	queue->qhdr_read_idx = new_read_idx;
 
-	if (queue->qhdr_read_idx != queue->qhdr_write_idx)
+	if (new_read_idx != write_idx)
 		queue->qhdr_rx_req = 0;
 	else
 		queue->qhdr_rx_req = receive_request;
+
+	queue->qhdr_read_idx = new_read_idx;
 
 	*pb_tx_req_is_set = (1 == queue->qhdr_tx_req) ? 1 : 0;
 
@@ -937,8 +959,6 @@ err_create_pkt:
 	return rc;
 }
 
-static DECLARE_COMPLETION(release_resources_done);
-
 static int __alloc_imem(struct venus_hfi_device *device, unsigned long size)
 {
 	struct imem *imem = NULL;
@@ -1147,6 +1167,21 @@ static struct clock_info *__get_clock(struct venus_hfi_device *device,
 	}
 
 	dprintk(VIDC_WARN, "%s Clock %s not found\n", __func__, name);
+
+	return NULL;
+}
+
+static struct regulator_info *__get_regulator(struct venus_hfi_device *device,
+			char *name)
+{
+	struct regulator_info *r;
+
+	venus_hfi_for_each_regulator(device, r) {
+		if (!strcmp(r->name, name))
+			return r;
+	}
+
+	dprintk(VIDC_WARN, "%s Regulator %s not found\n", __func__, name);
 
 	return NULL;
 }
@@ -1571,7 +1606,7 @@ static int __iface_cmdq_write_relaxed(struct venus_hfi_device *device,
 	__strict_check(device);
 
 	if (!__core_in_valid_state(device)) {
-		dprintk(VIDC_DBG, "%s - fw not in init state\n", __func__);
+		dprintk(VIDC_ERR, "%s - fw not in init state\n", __func__);
 		result = -EINVAL;
 		goto err_q_null;
 	}
@@ -2157,8 +2192,6 @@ static int venus_hfi_core_init(void *device)
 
 	dev = device;
 	mutex_lock(&dev->lock);
-
-	init_completion(&release_resources_done);
 
 	rc = __load_fw(dev);
 	if (rc) {
@@ -3320,8 +3353,6 @@ static void __process_sys_error(struct venus_hfi_device *device)
 {
 	struct hfi_sfr_struct *vsfr = NULL;
 
-	__set_state(device, VENUS_STATE_DEINIT);
-
 	/* Once SYS_ERROR received from HW, it is safe to halt the AXI.
 	 * With SYS_ERROR, Venus FW may have crashed and HW might be
 	 * active and causing unnecessary transactions. Hence it is
@@ -3353,7 +3384,11 @@ static void __flush_debug_queue(struct venus_hfi_device *device, u8 *packet)
 	}
 
 	if (!packet) {
-		packet = kzalloc(VIDC_IFACEQ_VAR_HUGE_PKT_SIZE, GFP_TEMPORARY);
+		if (VIDC_IFACEQ_VAR_HUGE_PKT_SIZE > PAGE_SIZE)
+			packet = vzalloc(VIDC_IFACEQ_VAR_HUGE_PKT_SIZE);
+		else
+			packet = kzalloc(VIDC_IFACEQ_VAR_HUGE_PKT_SIZE,
+					GFP_TEMPORARY);
 		if (!packet) {
 			dprintk(VIDC_ERR, "In %s() Fail to allocate mem\n",
 				__func__);
@@ -3382,7 +3417,7 @@ static void __flush_debug_queue(struct venus_hfi_device *device, u8 *packet)
 	}
 
 	if (local_packet)
-		kfree(packet);
+		kvfree(packet);
 }
 
 static struct hal_session *__get_session(struct venus_hfi_device *device,
@@ -3410,10 +3445,14 @@ static int __response_handler(struct venus_hfi_device *device)
 
 	packets = device->response_pkt;
 
-	raw_packet = kzalloc(VIDC_IFACEQ_VAR_HUGE_PKT_SIZE, GFP_TEMPORARY);
+	if (VIDC_IFACEQ_VAR_HUGE_PKT_SIZE > PAGE_SIZE)
+		raw_packet = vzalloc(VIDC_IFACEQ_VAR_HUGE_PKT_SIZE);
+	else
+		raw_packet = kzalloc(VIDC_IFACEQ_VAR_HUGE_PKT_SIZE,
+				GFP_TEMPORARY);
 	if (!raw_packet || !packets) {
 		dprintk(VIDC_ERR, "%s: Failed to allocate memory\n",  __func__);
-		kfree(raw_packet);
+		kvfree(raw_packet);
 		return 0;
 	}
 
@@ -3461,7 +3500,6 @@ static int __response_handler(struct venus_hfi_device *device)
 			break;
 		case HAL_SYS_RELEASE_RESOURCE_DONE:
 			dprintk(VIDC_DBG, "Received SYS_RELEASE_RESOURCE\n");
-			complete(&release_resources_done);
 			break;
 		case HAL_SYS_INIT_DONE:
 			dprintk(VIDC_DBG, "Received SYS_INIT_DONE\n");
@@ -3561,6 +3599,9 @@ static int __response_handler(struct venus_hfi_device *device)
 					"Too many packets in message queue to handle at once, deferring read\n");
 			break;
 		}
+		/* do not read packets after sys error packet */
+		if (info->response_type == HAL_SYS_ERROR)
+			break;
 	}
 
 	if (requeue_pm_work && device->res->sw_power_collapsible) {
@@ -3575,7 +3616,7 @@ static int __response_handler(struct venus_hfi_device *device)
 exit:
 	__flush_debug_queue(device, raw_packet);
 
-	kfree(raw_packet);
+	kvfree(raw_packet);
 	return packet_count;
 }
 
@@ -3624,6 +3665,12 @@ err_no_work:
 		i < num_responses; ++i) {
 		struct msm_vidc_cb_info *r = &device->response_pkt[i];
 
+		if (!__core_in_valid_state(device)) {
+			dprintk(VIDC_ERR,
+				"Ignore responses from %d to %d as device is in invalid state",
+				(i + 1), num_responses);
+			break;
+		}
 		device->callback(r->response_type, &r->response);
 	}
 
@@ -4101,10 +4148,57 @@ static int __enable_hw_power_collapse(struct venus_hfi_device *device)
 	return rc;
 }
 
+static int __core_clk_reset(struct venus_hfi_device *device,
+				enum clk_reset_action action)
+{
+	int rc = 0;
+	struct regulator_info *rinfo;
+	struct clock_info *vc;
+
+	rinfo = __get_regulator(device, "venus");
+	if (!rinfo)
+		return -EINVAL;
+
+	/*
+	 * This is a workaround for msm8996 V2, because MDP enables
+	 * Venus GDSC. Due to MDP's vote on Venus GDSC, some of Venus
+	 * registers are not cleared after firmware is unloaded. This
+	 * causes subsequent video sessions to fail. By resetting
+	 * core_clk we are forcing a hard reset and ensure each
+	 * firmware load starts on a clean slate.
+	 * For targets which do not need to reset the core_clk, clock
+	 * driver returns -EPERM. Do not consider such cases as erroneous.
+	 */
+	dprintk(VIDC_DBG, "%s core-clk\n",
+		action == CLK_RESET_DEASSERT ? "de-assert" : "assert");
+	vc = __get_clock(device, "core_clk");
+	if (vc) {
+		rc = clk_reset(vc->clk, action);
+		if (rc == -EPERM) {
+			rc = 0;
+			dprintk(VIDC_DBG, "%s No need to reset\n", __func__);
+		} else if (rc) {
+			dprintk(VIDC_ERR,
+				"clk_reset action - %d failed: %d\n",
+				action, rc);
+			return rc;
+		}
+	} else {
+		return -EINVAL;
+	}
+	udelay(1);
+	return rc;
+}
+
 static int __enable_regulators(struct venus_hfi_device *device)
 {
 	int rc = 0, c = 0;
 	struct regulator_info *rinfo;
+
+	rc = __core_clk_reset(device, CLK_RESET_DEASSERT);
+	if (rc)
+		return rc;
+
 
 	dprintk(VIDC_DBG, "Enabling regulators\n");
 
@@ -4140,6 +4234,8 @@ static int __disable_regulators(struct venus_hfi_device *device)
 
 	venus_hfi_for_each_regulator_reverse(device, rinfo)
 		__disable_regulator(rinfo);
+
+	rc = __core_clk_reset(device, CLK_RESET_ASSERT);
 
 	return rc;
 }
@@ -4409,6 +4505,14 @@ static void __unload_fw(struct venus_hfi_device *device)
 		flush_workqueue(device->venus_pm_workq);
 
 	__vote_buses(device, NULL, 0);
+	/*
+	 * If the core_clk is asserted, then PIL cannot enable
+	 * any of the venus clocks. So deassert the clock before
+	 * calling subsystem_put.
+	 */
+	if (__core_clk_reset(device, CLK_RESET_DEASSERT))
+		dprintk(VIDC_ERR, "failed to deassert core_clk\n");
+
 	subsystem_put(device->resources.fw.cookie);
 	__interface_queues_release(device);
 	__venus_power_off(device, false);
